@@ -1,242 +1,251 @@
 package top.srcrs;
 
-import com.alibaba.fastjson2.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import top.srcrs.domain.Config;
 import top.srcrs.domain.UserData;
-import top.srcrs.util.*;
+import top.srcrs.util.Account;
+import top.srcrs.util.InitUserAgent;
+import top.srcrs.util.ReadConfig;
+import top.srcrs.util.Request;
+import top.srcrs.util.SendDingTalk;
+import top.srcrs.util.SendPushPlus;
+import top.srcrs.util.SendServerChan;
+import top.srcrs.util.SendTelegram;
+import top.srcrs.util.StringUtil;
+import top.srcrs.util.TaskRegistry;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 启动类，程序运行开始的地方
+ * 启动类，程序运行开始的地方。
+ *
  * @author srcrs
  * @Time 2020-10-13
  */
 @Slf4j
-public class BiliStart {
-    /** 获取DATA对象 */
-    private static final UserData USER_DATA = UserData.getInstance();
-    /** 访问成功 */
-    private static final String SUCCESS = "0";
-    /** 账号未登录，即 Cookie 已失效 */
-    private static final String NOT_LOGGED_IN = "-101";
-    /** 获取Config配置的对象 */
-    private static final Config CONFIG = Config.getInstance();
-    /** 标记是否有任务失败 */
-    private static boolean hasFailures = false;
+public final class BiliStart {
 
-    public static void main(String ...args) {
-        // 设置全局程序超时，防止程序无限运行
-        Thread mainThread = Thread.currentThread();
-        Thread timeoutThread = new Thread(() -> {
+    private BiliStart() {
+    }
+
+    private static final UserData USER_DATA = UserData.getInstance();
+    private static final Config CONFIG = Config.getInstance();
+
+    /** 最高等级，到了这一级就不再估算升级时间 */
+    private static final String MAX_LEVEL = "6";
+    /** 默认的整体超时时间，可用环境变量 BILI_TIMEOUT_MINUTES 调整 */
+    private static final int DEFAULT_TIMEOUT_MINUTES = 10;
+
+    /** 任务抛出未捕获异常的次数 */
+    private static int failedTasks = 0;
+
+    public static void main(String... args) {
+        Thread watchdog = startWatchdog();
+        int exitCode = 0;
+        try {
+            exitCode = runAll();
+        } catch (RuntimeException e) {
+            log.error("💔程序运行出现未预期的异常: ", e);
+            exitCode = 1;
+        } finally {
+            watchdog.interrupt();
+            notifyUser();
+        }
+        System.exit(exitCode);
+    }
+
+    /**
+     * 完整跑一遍。
+     *
+     * @return 进程退出码
+     */
+    private static int runAll() {
+        if (!loadCookie()) {
+            log.error("💔请在 Github Secrets 中添加你的 Cookie 信息 (BILI_JCT / SESSDATA / DEDEUSERID)");
+            return 1;
+        }
+
+        ReadConfig.transformation("/config.yml");
+        Request.setUserAgent(InitUserAgent.getOne());
+
+        if (!Account.refresh()) {
+            return 1;
+        }
+
+        log.info("【用户名】: {}", StringUtil.hideString(USER_DATA.getUname(), 1, 1, '*'));
+        log.info("【硬币】: {}", USER_DATA.getMoney());
+        log.info("【经验】: {}", USER_DATA.getCurrentExp());
+
+        runTasks();
+        logLevelEstimate();
+
+        log.info("本次任务运行完毕。");
+        if (Request.transportErrors() > 0) {
+            log.warn("⚠️本次运行有 {} 次请求始终没能成功，部分任务可能没做完", Request.transportErrors());
+        }
+        if (failedTasks > 0) {
+            log.error("💔有 {} 个任务执行异常，请检查上面的日志", failedTasks);
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
+     * 依次执行所有任务。单个任务出错不影响后面的任务。
+     */
+    private static void runTasks() {
+        List<Task> tasks = TaskRegistry.instantiate();
+        for (Task task : tasks) {
+            String name = task.getClass().getSimpleName();
             try {
-                // 程序最多运行2分钟
-                TimeUnit.MINUTES.sleep(2);
-                log.error("💔程序运行超时(2分钟)，强制退出");
+                log.debug("开始执行任务: {}", name);
+                task.run();
+            } catch (Exception e) {
+                log.error("💔任务执行失败 [{}] : ", name, e);
+                failedTasks++;
+            }
+        }
+    }
+
+    /**
+     * 从环境变量读取 Cookie。
+     *
+     * @return 三个变量都存在返回 true
+     */
+    private static boolean loadCookie() {
+        String biliJct = System.getenv("BILI_JCT");
+        String sessData = System.getenv("SESSDATA");
+        String dedeUserId = System.getenv("DEDEUSERID");
+        if (StringUtil.isAnyBlank(biliJct, sessData, dedeUserId)) {
+            return false;
+        }
+        USER_DATA.setCookie(StringUtil.trimToEmpty(biliJct),
+                StringUtil.trimToEmpty(sessData),
+                StringUtil.trimToEmpty(dedeUserId));
+        return true;
+    }
+
+    /**
+     * 兜底的超时保护，卡死时不至于把 Actions 的额度耗光。
+     *
+     * @return 看门狗线程，正常结束时需要中断掉
+     */
+    private static Thread startWatchdog() {
+        int minutes = timeoutMinutes();
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(minutes * 60_000L);
+                log.error("💔程序运行超时({}分钟)，强制退出", minutes);
                 System.exit(1);
             } catch (InterruptedException e) {
-                // 正常退出时会中断这个线程
-                log.debug("超时监控线程被中断，程序正常结束");
+                Thread.currentThread().interrupt();
             }
-        });
-        timeoutThread.setDaemon(true);
-        timeoutThread.start();
+        }, "bili-task-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+        return watchdog;
+    }
 
+    private static int timeoutMinutes() {
+        String configured = System.getenv("BILI_TIMEOUT_MINUTES");
+        if (StringUtil.isNotBlank(configured)) {
+            try {
+                int minutes = Integer.parseInt(configured.trim());
+                if (minutes > 0) {
+                    return minutes;
+                }
+            } catch (NumberFormatException e) {
+                log.warn("⚠️BILI_TIMEOUT_MINUTES 不是数字，按默认 {} 分钟处理", DEFAULT_TIMEOUT_MINUTES);
+            }
+        }
+        return DEFAULT_TIMEOUT_MINUTES;
+    }
+
+    /**
+     * 输出升级预计。
+     */
+    private static void logLevelEstimate() {
+        String level = USER_DATA.getCurrentLevel();
+        if (MAX_LEVEL.equals(level)) {
+            log.info("【升级预计】: 当前等级为: Lv{} ,已经是最高等级", MAX_LEVEL);
+            log.info("【温馨提示】: 可在配置文件中关闭每日投币操作");
+            return;
+        }
+        int days = daysToNextLevel();
+        if (days < 0) {
+            log.info("【升级预计】: 当前等级为: Lv{}", level);
+            return;
+        }
+        log.info("【升级预计】: 当前等级为: Lv{} ,预计升级到下一级还需要: {} 天", level, days);
+    }
+
+    /**
+     * 估算距离升到下一级还要几天。
+     * <p>
+     * 为了少打几次接口，估算里认为每天都能拿满登录和观看分享的经验，会有一天左右的误差。
+     *
+     * @return 天数；数据不全时返回 -1
+     */
+    private static int daysToNextLevel() {
+        Integer currentExpValue = USER_DATA.getCurrentExp();
+        if (currentExpValue == null) {
+            return -1;
+        }
+        int nextExp;
         try {
-            log.info("🚀程序启动，开始检查环境变量");
-            if(checkEnv()){
-                log.error("💔请在Github Secrets中添加你的Cookie信息");
-                System.exit(1);
-            }
-            log.info("✅环境变量检查通过");
-
-            /* 读取yml文件配置信息 */
-            log.info("📖开始读取配置文件");
-            ReadConfig.transformation("/config.yml");
-            log.info("✅配置文件读取完成");
-
-            /* 如果用户账户有效 */
-            log.info("🔍开始验证用户账户");
-            if(check()){
-                log.info("✅账户验证成功");
-                log.info("【用户名】: {}",StringUtil.hideString(USER_DATA.getUname(),1,1,'*'));
-                log.info("【硬币】: {}", USER_DATA.getMoney());
-                log.info("【经验】: {}", USER_DATA.getCurrentExp());
-                /* 动态执行task包下的所有java代码 */
-                scanTask();
-                /* 当用户等级为Lv6时，升级到下一级 next_exp 值为 -- 代表无穷大 */
-                String maxLevel = "6";
-                if(maxLevel.equals(USER_DATA.getCurrentLevel())){
-                    log.info("【升级预计】: 当前等级为: Lv{} ,已经是最高等级", maxLevel);
-                    log.info("【温馨提示】: 可在配置文件中关闭每日投币操作");
-                } else{
-                    log.info("【升级预计】: 当前等级为: Lv{} ,预计升级到下一级还需要: {} 天",
-                            USER_DATA.getCurrentLevel(), getNextLevel());
-                }
-                log.info("本次任务运行完毕。");
-
-                // 如果有任务失败，退出码应该为1
-                if(hasFailures){
-                    log.error("💔部分任务执行失败，请检查日志");
-                    System.exit(1);
-                }
-            } else {
-                log.error("💔账户验证失败，程序退出");
-                System.exit(1);
-            }
-        } finally {
-            // 程序正常结束时中断超时监控线程
-            timeoutThread.interrupt();
+            nextExp = Integer.parseInt(StringUtil.trimToEmpty(USER_DATA.getNextExp()));
+        } catch (NumberFormatException e) {
+            // 满级时这个字段是 "--"
+            return -1;
         }
 
-        // server酱
-        if(StringUtil.isNotBlank(System.getenv("SCKEY"))){
-            SendServer.send(System.getenv("SCKEY"));
+        int currentExp = currentExpValue;
+        int wallet = USER_DATA.getMoney() == null ? 0 : USER_DATA.getMoney().intValue();
+        int planned = CONFIG.getCoin() == null ? 0 : Math.max(CONFIG.getCoin(), 0);
+        int coin = Math.min(wallet, planned);
+
+        int days = 0;
+        while (currentExp < nextExp && days < 100_000) {
+            days++;
+            wallet += 1;
+            // 每日登录 5 + 观看 5 + 分享 5，投一个币 10
+            currentExp += 15 + coin * 10;
+            wallet -= coin;
+            coin = Math.min(wallet, planned);
         }
-        // Server酱 测试号版
-        if(StringUtil.isNotBlank(System.getenv("SENDKEY"))){
-            SendServerChan.send(System.getenv("SENDKEY"));
+        return days;
+    }
+
+    /**
+     * 把运行结果推送出去。任意一个渠道出错都不影响其它渠道。
+     */
+    private static void notifyUser() {
+        if (StringUtil.isBlank(System.getenv("SENDKEY")) && StringUtil.isNotBlank(System.getenv("SCKEY"))) {
+            log.warn("⚠️SCKEY 对应的旧版 Server 酱 (sc.ftqq.com) 早已下线，本次按 SENDKEY 处理，"
+                    + "建议在 Secrets 里改名为 SENDKEY 并换成 Server 酱 Turbo 的 SendKey");
         }
-        // PUSHPLUSTK
-        if(StringUtil.isNotBlank(System.getenv("PUSHPLUSTK"))){
+        String sendKey = firstNotBlank(System.getenv("SENDKEY"), System.getenv("SCKEY"));
+        if (StringUtil.isNotBlank(sendKey)) {
+            SendServerChan.send(sendKey);
+        }
+        if (StringUtil.isNotBlank(System.getenv("PUSHPLUSTK"))) {
             SendPushPlus.send(System.getenv("PUSHPLUSTK"));
         }
-        /* 此时数组的长度为4，就默认填写的是填写的钉钉 webHook 链接 */
-        if(StringUtil.isNotBlank(System.getenv("DINGTALK"))){
+        if (StringUtil.isNotBlank(System.getenv("DINGTALK"))) {
             SendDingTalk.send(System.getenv("DINGTALK"));
         }
-        /* Telegram Bot推送 */
-        if(StringUtil.isNotBlank(System.getenv("TELEGRAM_BOT_TOKEN"))
-                && StringUtil.isNotBlank(System.getenv("TELEGRAM_CHAT_ID"))){
+        if (StringUtil.isNotBlank(System.getenv("TELEGRAM_BOT_TOKEN"))
+                && StringUtil.isNotBlank(System.getenv("TELEGRAM_CHAT_ID"))) {
             SendTelegram.send(System.getenv("TELEGRAM_BOT_TOKEN"), System.getenv("TELEGRAM_CHAT_ID"));
         }
     }
 
-    /**
-     * 存储所有 class 全路径名
-     * 因为测试的时候发现，在 windows 中是按照字典排序的
-     * 但是在 Linux 中并不是字典排序我就很迷茫
-     * 因为部分任务是需要有顺序的去执行
-     */
-    private static void scanTask() {
-        List<Class<?>> clazzList = new ArrayList<>();
-        TaskRegistry pack = new TaskRegistry() {
-            @Override
-            public void dealClass(String className) {
-                try{
-                    Class<?> clazz = Class.forName(className);
-                    // 判断类是否实现了接口Task
-                    if (Arrays.stream(clazz.getInterfaces()).parallel().anyMatch(taskI -> taskI.equals(Task.class))) {
-                        clazzList.add(clazz);
-                    }
-                } catch (Exception e){
-                    log.error("💔反射获取对象错误 : ", e);
-                }
+    private static String firstNotBlank(String... values) {
+        for (String value : values) {
+            if (StringUtil.isNotBlank(value)) {
+                return value;
             }
-        };
-        pack.runTasks();
-
-        clazzList.stream().sorted(Comparator.comparing(Class::getName)).forEach(clazz -> {
-            try {
-                Constructor<?> constructor = clazz.getConstructor();
-                Object object = constructor.newInstance();
-                Method method = object.getClass().getMethod("run");
-                method.invoke(object);
-            } catch (Exception e){
-                log.error("💔任务执行失败 [{}] : ", clazz.getSimpleName(), e);
-                hasFailures = true;
-            }
-        });
-    }
-
-    public static boolean checkEnv() {
-        String BILI_JCT = System.getenv("BILI_JCT");
-        String SESSDATA = System.getenv("SESSDATA");
-        String DEDEUSERID = System.getenv("DEDEUSERID");
-        USER_DATA.setCookie(BILI_JCT, SESSDATA, DEDEUSERID);
-        return StringUtil.isAnyBlank(BILI_JCT, SESSDATA, DEDEUSERID);
-    }
-
-    /**
-     * 检查用户的状态
-     * @return boolean
-     * @author srcrs
-     * @Time 2020-10-13
-     */
-    public static boolean check(){
-        log.info("🌐初始化UserAgent");
-        Request.UserAgent = InitUserAgent.getOne();
-        log.info("📡发送账户验证请求到Bilibili API");
-        JSONObject jsonObject = Request.get("https://api.bilibili.com/x/web-interface/nav");
-        String code = jsonObject.getString("code");
-        log.info("📨API响应状态: code={}", code);
-        JSONObject object = jsonObject.getJSONObject("data");
-        if(SUCCESS.equals(code)){
-            JSONObject levelInfo = object.getJSONObject("level_info");
-            /* 用户名 */
-            USER_DATA.setUname(object.getString("uname"));
-            /* 账户的uid */
-            USER_DATA.setMid(object.getString("mid"));
-            /* vip类型 */
-            USER_DATA.setVipType(object.getString("vipType"));
-            /* 硬币数 */
-            USER_DATA.setMoney(object.getBigDecimal("money"));
-            /* 经验 */
-            USER_DATA.setCurrentExp(levelInfo.getIntValue("current_exp"));
-            /* 大会员状态 */
-            USER_DATA.setVipStatus(object.getString("vipStatus"));
-            /* 钱包B币卷余额 */
-            USER_DATA.setCouponBalance(object.getJSONObject("wallet").getIntValue("coupon_balance"));
-            /* 升级到下一级所需要的经验 */
-            USER_DATA.setNextExp(levelInfo.getString("next_exp"));
-            /* 获取当前的等级 */
-            USER_DATA.setCurrentLevel(levelInfo.getString("current_level"));
-            return true;
         }
-        if(NOT_LOGGED_IN.equals(code)){
-            log.error("💔账户已失效，请在Secrets重新绑定你的信息");
-            return false;
-        }
-        log.error("💔未知错误，API返回代码: {}", code);
-        return false;
-    }
-
-    /**
-     * 计算到下一级所需要的天数
-     * 由于风控抓的紧，为减少相关 api 的请求次数，会有一天的误差
-     * @return int 距离升级到下一等级还需要几天
-     * @author srcrs
-     * @Time 2020-11-17
-     */
-    private static int getNextLevel(){
-        /* 当前经验数 */
-        int currentExp = USER_DATA.getCurrentExp();
-        /* 到达下一级所需要的经验数 */
-        int nextExp = Integer.parseInt(USER_DATA.getNextExp());
-        /* 获取当前硬币数量 */
-        int num1 = USER_DATA.getMoney().intValue();
-        /* 获取配置中每日投币数量 */
-        int num2 = CONFIG.getCoin();
-        /* 避免投币数设置成负数异常 */
-        num2 = Math.max(num2,0);
-        /* 实际每日能需要投币数 */
-        int num = Math.min(num1,num2);
-        /* 距离升级到下一级所需要的天数 */
-        int nextNum = 0;
-        while(currentExp < nextExp){
-            nextNum += 1;
-            num1 += 1;
-            currentExp += (15+num*10);
-            num1 -= num;
-            num = Math.min(num1,num2);
-        }
-        return nextNum;
+        return "";
     }
 }

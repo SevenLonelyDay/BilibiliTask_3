@@ -3,36 +3,45 @@ package top.srcrs.domain;
 import java.util.List;
 
 /**
- * 项目的配置类。
+ * 项目的配置。
+ * <p>
+ * 字段是静态的，实例方法只是给 SnakeYAML 当 JavaBean 用：它会 new 一个临时对象再调 setter，
+ * 值最终落到静态字段上，任何地方通过 {@link #getInstance()} 都能读到同一份配置。
+ * <p>
+ * 每个字段都给了保守的默认值，配置文件读不出来时程序仍能跑，只是不做有副作用的操作。
+ *
  * @author srcrs
  * @Time 2020-10-13
  */
 public class Config {
+
     private static final Config CONFIG = new Config();
 
-    public static Config getInstance(){
+    public static Config getInstance() {
         return CONFIG;
     }
-    private Config(){}
 
-    /** 代表所需要投币的数量 */
-    private static Integer coin;
-    /** 送出即将过期的礼物 true 默认送出*/
-    private static boolean gift;
-    /** 要将银瓜子转换成硬币 true 默认转换*/
-    private static boolean s2c;
-    /** 自动使用 B 币卷 */
-    private static String autoBiCoin;
-    /** 用户设备的标识 */
-    private static String platform;
-    /** 投币给自定义的 up 主 */
+    private Config() {
+    }
+
+    /** 每日投币数量 [0,5] */
+    private static Integer coin = 0;
+    /** 是否送出即将过期的礼物 */
+    private static boolean gift = false;
+    /** 是否把银瓜子兑换成硬币 */
+    private static boolean s2c = false;
+    /** 月底如何使用 B 币券 [0 不使用, 1 给自己充电, 2 兑换金瓜子] */
+    private static String autoBiCoin = "0";
+    /** 漫画签到使用的设备标识 [android, ios] */
+    private static String platform = "android";
+    /** 优先投币的 up 主 uid 列表 */
     private static List<String> upList;
-    /** 自动进行漫画签到任务 */
-    private static boolean manga;
-    /** 送出即将过期礼物给此 up 的直播间 */
+    /** 是否执行漫画签到 */
+    private static boolean manga = false;
+    /** 优先把即将过期的礼物送给这个 up 的直播间 */
     private static String upLive;
-    /** 对于进行投币的视频选择是否点赞 */
-    private static String selectLike;
+    /** 投币时是否顺带点赞 [0 否, 1 是] */
+    private static String selectLike = "0";
 
     public String getSelectLike() {
         return selectLike;
@@ -105,5 +114,4 @@ public class Config {
     public void setS2c(boolean s2c) {
         Config.s2c = s2c;
     }
-
 }

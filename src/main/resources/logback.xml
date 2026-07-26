@@ -36,8 +36,8 @@
         <append>false</append>
     </appender>
 
-    <!-- root logger配置 -->
-    <root level="ALL">
+    <!-- root logger配置，需要排查问题时把环境变量 LOG_LEVEL 设成 DEBUG -->
+    <root level="${LOG_LEVEL:-INFO}">
         <appender-ref ref="console"/>
         <appender-ref ref="file"/>
     </root>

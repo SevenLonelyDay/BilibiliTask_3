@@ -5,60 +5,81 @@ import lombok.extern.slf4j.Slf4j;
 import top.srcrs.Task;
 import top.srcrs.domain.Config;
 import top.srcrs.domain.UserData;
+import top.srcrs.util.BiliApi;
 import top.srcrs.util.Request;
+import top.srcrs.util.StringUtil;
 
 /**
- * 银瓜子兑换硬币
+ * 银瓜子兑换硬币。
+ *
  * @author srcrs
  * @Time 2020-10-13
  */
 @Slf4j
 public class Silver2CoinTask implements Task {
-    UserData userData = UserData.getInstance();
-    Config config = Config.getInstance();
+
+    private final UserData userData = UserData.getInstance();
+    private final Config config = Config.getInstance();
+
+    /** 兑换一个硬币需要的银瓜子 */
+    private static final int SILVER_PER_COIN = 700;
 
     @Override
-    public void run(){
-        /* 获得银瓜子的数量 */
-        Integer silver = getSilver();
-        log.info("【银瓜子】: {}",silver);
-        if(config.isS2c()){
-            try{
-                /* 如果银瓜子数量小于700没有必要再进行兑换 */
-                int minSilver = 700;
-                if(silver < minSilver){
-                    log.info("【银瓜子兑换硬币】: {}","银瓜子余额不足❌");
-                } else{
-                    log.info("【银瓜子兑换硬币】: {}",silver2coin().getString("msg") + "✔");
-                }
-            } catch (Exception e){
-                log.error("💔银瓜子兑换硬币错误 : ", e);
-            }
-        } else{
-            log.info("【银瓜子兑换硬币】: " + "自定义配置不将银瓜子兑换硬币✔");
+    public void run() {
+        int silver = getSilver();
+        log.info("【银瓜子】: {}", silver);
+
+        if (!config.isS2c()) {
+            log.info("【银瓜子兑换硬币】: 自定义配置不将银瓜子兑换硬币✔");
+            return;
         }
+        if (silver < SILVER_PER_COIN) {
+            log.info("【银瓜子兑换硬币】: 银瓜子余额不足❌");
+            return;
+        }
+        log.info("【银瓜子兑换硬币】: {}", exchange());
     }
 
     /**
-     * 银瓜子兑换成硬币
-     * @return JSONObject
-     * @author srcrs
-     * @Time 2020-10-13
+     * 兑换硬币。
+     * <p>
+     * {@code pay/v1/Exchange/silver2coin} 是老地址，现在走 {@code xlive/revenue}，
+     * 老地址保留作兜底。
+     *
+     * @return 展示用的结果文案
      */
-    public JSONObject silver2coin(){
-        JSONObject pJson = new JSONObject();
-        pJson.put("csrf", userData.getBiliJct());
-        return Request.post("https://api.live.bilibili.com/pay/v1/Exchange/silver2coin", pJson);
+    private String exchange() {
+        JSONObject params = new JSONObject();
+        params.put("csrf", userData.getBiliJct());
+        params.put("csrf_token", userData.getBiliJct());
+
+        JSONObject response = Request.post(BiliApi.LIVE_SILVER2COIN, params, BiliApi.REFERER_LIVE);
+        if (Request.code(response) != 0) {
+            log.debug("新版兑换接口返回 {}，尝试旧接口", response.getString("code"));
+            response = Request.post(BiliApi.LIVE_SILVER2COIN_LEGACY, params, BiliApi.REFERER_LIVE);
+        }
+        if (Request.code(response) == 0) {
+            String message = response.getString("msg");
+            if (StringUtil.isBlank(message)) {
+                message = response.getString("message");
+            }
+            return StringUtil.isBlank(message) ? "成功✔" : message + "✔";
+        }
+        return response.getString("message") + "❌";
     }
 
     /**
-     * 获取银瓜子的数量
-     * @return Integer
-     * @author srcrs
-     * @Time 2020-10-17
+     * 查询银瓜子余额。
+     *
+     * @return 银瓜子数量，查不到时为 0
      */
-    public Integer getSilver(){
-        JSONObject jsonObject = Request.get("https://api.live.bilibili.com/xlive/web-ucenter/user/get_user_info");
-        return Integer.parseInt(jsonObject.getJSONObject("data").getString("silver"));
+    private int getSilver() {
+        JSONObject response = Request.get(BiliApi.LIVE_USER_INFO, new JSONObject(), BiliApi.REFERER_LIVE);
+        if (Request.code(response) != 0) {
+            log.warn("⚠️获取银瓜子余额失败: {}", response.getString("message"));
+            return 0;
+        }
+        JSONObject data = response.getJSONObject("data");
+        return data == null ? 0 : data.getIntValue("silver", 0);
     }
 }

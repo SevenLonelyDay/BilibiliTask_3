@@ -1,58 +1,46 @@
 package top.srcrs.util;
 
 import com.alibaba.fastjson2.JSONObject;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
-import org.apache.http.HttpStatus;
-import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.methods.RequestBuilder;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
 
 import java.nio.charset.StandardCharsets;
 
 /**
- * 给 Telegram 群组机器人推送消息
+ * 推送到 Telegram Bot。
+ *
  * @author qiwihui
  * @Time 2020-12-16
  */
-@Slf4j
-public class SendTelegram {
+public final class SendTelegram {
 
-    private SendTelegram(){}
+    private SendTelegram() {
+    }
+
+    /** Telegram 单条消息的长度上限是 4096 个字符 */
+    private static final int MAX_MESSAGE_LENGTH = 4000;
 
     /**
-     * 发送消息给群组
-     * @param telegramBotToken 机器人 Token
-     * @param telegramChatID 群组 ID
-     * @author qiwihui
-     * @Time 2020-12-16
+     * 发送运行结果。
+     *
+     * @param botToken 机器人 Token
+     * @param chatId   会话 ID
      */
-    public static void send(String telegramBotToken, String telegramChatID){
-        /* 将要推送的数据 */
-        String desp = ReadLog.getMarkDownString("logs/logback.log");
-        JSONObject bodyJson = new JSONObject();
-        bodyJson.put("chat_id", telegramChatID);
-        bodyJson.put("text", "BilibiliTask运行结果:\n" + desp);
-        HttpUriRequest httpPost = RequestBuilder.post()
-                .addHeader("Content-Type", "application/json;charset=utf-8")
-                .setUri("https://api.telegram.org/bot"+telegramBotToken+"/sendMessage")
-                .setEntity(new StringEntity(bodyJson.toString(),"UTF-8"))
-                .build();
-        try(CloseableHttpClient client = HttpClients.createDefault()){
-            HttpResponse resp = client.execute(httpPost);
-            HttpEntity entity = resp.getEntity();
-            String respContent = EntityUtils.toString(entity, StandardCharsets.UTF_8);
-            if(resp.getStatusLine().getStatusCode() == HttpStatus.SC_OK){
-                log.info("【Telegram推送】: 正常✔");
-            } else{
-                log.info("【Telegram推送】: 失败, HTTP状态码: {}❌", resp.getStatusLine().getStatusCode());
-            }
-        } catch (Exception e){
-            log.error("💔Telegram通知错误 : ", e);
+    public static void send(String botToken, String chatId) {
+        String text = "BilibiliTask运行结果:\n" + ReadLog.getMarkDownString("logs/logback.log");
+        if (text.length() > MAX_MESSAGE_LENGTH) {
+            // 超长会被 Telegram 直接拒收，保留结尾的汇总部分
+            text = "...\n" + text.substring(text.length() - MAX_MESSAGE_LENGTH);
         }
+
+        JSONObject body = new JSONObject();
+        body.put("chat_id", chatId);
+        body.put("text", text);
+
+        Notifier.send("Telegram", RequestBuilder.post()
+                .addHeader("Content-Type", "application/json; charset=UTF-8")
+                .setUri("https://api.telegram.org/bot" + botToken + "/sendMessage")
+                .setEntity(new StringEntity(body.toString(), StandardCharsets.UTF_8))
+                .build());
     }
 }

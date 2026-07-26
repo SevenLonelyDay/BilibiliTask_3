@@ -1,9 +1,8 @@
 pluginManagement {
     repositories {
-        maven {
-            url 'https://maven.aliyun.com/repository/gradle-plugin'
-        }
         gradlePluginPortal()
+        // 国内网络环境下的镜像，插件门户不可达时兜底
+        maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
     }
 }
 

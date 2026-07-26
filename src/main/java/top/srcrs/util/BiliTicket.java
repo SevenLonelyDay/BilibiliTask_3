@@ -7,104 +7,82 @@ import top.srcrs.domain.UserData;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 
 /**
- * Bilibili Ticket生成工具类
- * 用于生成bili_ticket以降低风控概率
+ * 生成 bili_ticket。
+ * <p>
+ * 带上这个 Cookie 能明显降低被风控拦下的概率。签名规则是对 {@code ts<时间戳>} 做
+ * HMAC-SHA256，密钥是 web 端 JS 里写死的 {@code XgwSnGZ1p}。
+ * <p>
+ * 注意参数必须放在查询串里：早先的实现把它们塞进了表单体，服务端一直回
+ * {@code -400 empty `ts` field}，等于这个 Cookie 从来没生效过。
  *
- * @author chuiba
- * @since 2025-01-21
+ * @author srcrs
+ * @Time 2026-07-26
  */
 @Slf4j
-public class BiliTicket {
+public final class BiliTicket {
+
+    private BiliTicket() {
+    }
 
     private static final String HMAC_KEY = "XgwSnGZ1p";
     private static final String KEY_ID = "ec02";
-    private static String cachedTicket = "";
-    private static long lastUpdateTime = 0;
-    private static final long TICKET_VALIDITY = 2 * 60 * 60 * 1000; // 2小时有效期
-    private static final int MAX_RETRIES = 3; // 最大重试次数
 
     /**
-     * 获取bili_ticket
+     * 取一个 bili_ticket。
+     *
+     * @return ticket；获取失败时返回空串，调用方按"没有这个 Cookie"处理
      */
-    public static String getBiliTicket() {
-        long currentTime = System.currentTimeMillis();
-        
-        // 检查缓存是否有效
-        if (!cachedTicket.isEmpty() && 
-            (currentTime - lastUpdateTime) < TICKET_VALIDITY) {
-            return cachedTicket;
+    public static String fetch() {
+        long ts = System.currentTimeMillis() / 1000;
+        String hexSign = hmacSha256("ts" + ts, HMAC_KEY);
+        if (StringUtil.isBlank(hexSign)) {
+            return "";
         }
 
-        // 获取新的ticket
-        for (int i = 0; i < MAX_RETRIES; i++) {
-            try {
-                long timestamp = currentTime / 1000;
-                String message = "ts" + timestamp;
-                String hexSign = hmacSha256(message, HMAC_KEY);
+        JSONObject params = new JSONObject();
+        params.put("key_id", KEY_ID);
+        params.put("hexsign", hexSign);
+        params.put("context[ts]", String.valueOf(ts));
+        params.put("csrf", StringUtil.trimToEmpty(UserData.getInstance().getBiliJct()));
 
-                JSONObject params = new JSONObject();
-                params.put("key_id", KEY_ID);
-                params.put("hexsign", hexSign);
-                params.put("context[ts]", timestamp);
-                params.put("csrf", UserData.getInstance().getBiliJct());
-
-                JSONObject response = Request.postWithoutBiliTicket(
-                    "https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket", 
-                    params
-                );
-
-                if ("0".equals(response.getString("code"))) {
-                    JSONObject data = response.getJSONObject("data");
-                    cachedTicket = data.getString("ticket");
-                    lastUpdateTime = currentTime;
-                    log.info("bili_ticket更新成功");
-                    return cachedTicket;
-                } else {
-                    log.warn("bili_ticket API返回错误: {} - {}", 
-                        response.getString("code"), response.getString("message"));
-                    // API返回错误码，不进行重试
-                    break;
-                }
-            } catch (Exception e) {
-                log.warn("bili_ticket获取失败，重试 {}/{}: {}", i + 1, MAX_RETRIES, e.getMessage());
-                if (i < MAX_RETRIES - 1) {
-                    try {
-                        Thread.sleep(1000 * (i + 1)); // 递增等待时间：1s, 2s, 3s
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
+        JSONObject response = Request.postQuery(BiliApi.GEN_WEB_TICKET, params);
+        if (Request.code(response) == 0) {
+            JSONObject data = response.getJSONObject("data");
+            String ticket = data == null ? null : data.getString("ticket");
+            if (StringUtil.isNotBlank(ticket)) {
+                log.debug("bili_ticket 获取成功");
+                return ticket;
             }
         }
-        
-        log.warn("bili_ticket获取失败，使用空值");
+        log.warn("⚠️bili_ticket 获取失败: {} - {}",
+                response.getString("code"), response.getString("message"));
         return "";
     }
 
     /**
-     * HMAC-SHA256签名
+     * HMAC-SHA256 并转成小写十六进制。
+     *
+     * @param data 待签名内容
+     * @param key  密钥
+     * @return 十六进制签名；失败时返回空串
      */
-    private static String hmacSha256(String data, String key) {
+    static String hmacSha256(String data, String key) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec secretKeySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
-            mac.init(secretKeySpec);
+            mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             byte[] hash = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-
-            StringBuilder hexString = new StringBuilder();
+            StringBuilder sb = new StringBuilder(hash.length * 2);
             for (byte b : hash) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) {
-                    hexString.append('0');
-                }
-                hexString.append(hex);
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
             }
-            return hexString.toString();
-        } catch (Exception e) {
-            log.error("💔HMAC-SHA256签名失败: ", e);
+            return sb.toString();
+        } catch (NoSuchAlgorithmException | InvalidKeyException e) {
+            log.error("💔bili_ticket 签名失败: ", e);
             return "";
         }
     }
