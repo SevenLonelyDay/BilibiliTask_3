@@ -3,205 +3,241 @@ package top.srcrs.util;
 import com.alibaba.fastjson2.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.security.NoSuchAlgorithmException;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
- * WBI签名工具类
- * 用于生成Bilibili API所需的WBI签名
+ * WBI 签名。
+ * <p>
+ * 2023 年起 B 站给一批 web 接口加上了 WBI 鉴权：从 {@code nav} 接口拿到 img_key / sub_key，
+ * 按固定的乱序表拼出 32 位 mixin_key，再把请求参数按 key 排序、URL 编码后拼上 mixin_key 求 MD5，
+ * 得到 {@code w_rid}，与 {@code wts} 一起作为参数发出去。
+ * <p>
+ * 算法说明见 <a href="https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/misc/sign/wbi.md">wbi.md</a>。
  *
- * @author chuiba
- * @since 2025-01-21
+ * @author srcrs
+ * @Time 2026-07-26
  */
 @Slf4j
-public class WbiSignature {
+public final class WbiSignature {
 
+    private WbiSignature() {
+    }
+
+    /** 官方 JS 里写死的乱序表 */
     private static final int[] MIX_KEY_ENC_TAB = {
-        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
-        33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
-        61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
-        36, 20, 34, 44, 52
+            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+            33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+            26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+            20, 34, 44, 52
     };
 
-    private static String imgKey = "";
-    private static String subKey = "";
-    private static long lastUpdateTime = 0;
-    private static final long UPDATE_INTERVAL = 10 * 60 * 1000; // 10分钟更新一次
+    /** 参数值里需要先剔除的字符，官方 JS 的行为 */
+    private static final String FILTERED_CHARS = "!'()*";
+
+    /** 密钥每天更新一次，本地缓存 30 分钟足够一次运行使用 */
+    private static final long KEY_TTL_MS = 30 * 60 * 1000L;
+
+    private static volatile String mixinKey = "";
+    private static volatile long keyUpdatedAt = 0L;
 
     /**
-     * 获取WBI签名参数
+     * 从 nav 接口的返回里提取并缓存 WBI 密钥。
+     * <p>
+     * 由 {@code BiliStart} 在校验账号时顺手调用，这样整个流程只需要请求一次 nav。
+     *
+     * @param navData nav 接口 data 节点，允许为 null
      */
-    public static Map<String, String> getWbiSign(Map<String, Object> params) {
-        return getWbiSignWithWks(params, false);
-    }
-
-    /**
-     * 获取带w_ks参数的WBI签名参数
-     * @param params 请求参数
-     * @param addSelf 是否添加w_ks参数
-     */
-    public static Map<String, String> getWbiSignWithWks(Map<String, Object> params, boolean addSelf) {
-        try {
-            // 更新密钥
-            updateKeys();
-
-            // 生成混合密钥
-            String mixinKey = getMixinKey(imgKey + subKey);
-
-            // 添加时间戳
-            long wts = System.currentTimeMillis() / 1000;
-            params.put("wts", wts);
-
-            // 新增 w_ks 参数支持
-            if (addSelf) {
-                String wKs = swapString(imgKey + subKey, 2);
-                params.put("w_ks", wKs);
-            }
-
-            // 排序参数并构建查询字符串
-            String query = buildSortedQuery(params);
-
-            // 计算MD5
-            String wRid = md5(query + mixinKey);
-
-            Map<String, String> result = new HashMap<>();
-            result.put("w_rid", wRid);
-            result.put("wts", String.valueOf(wts));
-            if (addSelf) {
-                result.put("w_ks", params.get("w_ks").toString());
-            }
-
-            return result;
-        } catch (Exception e) {
-            log.error("💔WBI签名生成失败: ", e);
-            return new HashMap<>();
-        }
-    }
-
-    /**
-     * 更新img_key和sub_key
-     */
-    private static void updateKeys() {
-        long currentTime = System.currentTimeMillis();
-        if (currentTime - lastUpdateTime < UPDATE_INTERVAL && !imgKey.isEmpty()) {
+    public static void updateFromNav(JSONObject navData) {
+        if (navData == null) {
             return;
         }
-
-        try {
-            // 添加超时保护，最多尝试3次
-            JSONObject navResp = null;
-            int retries = 0;
-            while (retries < 3) {
-                try {
-                    navResp = Request.get("https://api.bilibili.com/x/web-interface/nav");
-                    break;
-                } catch (Exception e) {
-                    retries++;
-                    log.warn("WBI密钥更新重试 {}/3: {}", retries, e.getMessage());
-                    if (retries >= 3) throw e;
-                    Thread.sleep(1000); // 等待1秒后重试
-                }
-            }
-
-            if (navResp != null && "0".equals(navResp.getString("code"))) {
-                JSONObject data = navResp.getJSONObject("data");
-                JSONObject wbiImg = data.getJSONObject("wbi_img");
-
-                String imgUrl = wbiImg.getString("img_url");
-                String subUrl = wbiImg.getString("sub_url");
-
-                // 提取文件名（去掉扩展名）
-                imgKey = getFileName(imgUrl);
-                subKey = getFileName(subUrl);
-
-                lastUpdateTime = currentTime;
-                log.info("WBI密钥更新成功: imgKey={}, subKey={}", imgKey.substring(0, 8) + "...", subKey.substring(0, 8) + "...");
-            } else {
-                throw new RuntimeException("导航API返回错误: " + (navResp != null ? navResp.getString("message") : "无响应"));
-            }
-
-        } catch (Exception e) {
-            log.error("💔WBI密钥更新失败: ", e);
-            // 使用默认值避免完全失败
-            if (imgKey.isEmpty()) {
-                imgKey = "7cd084941338484aae1ad9425b84077c";
-                subKey = "4932caff0ff746eab6f01bf08b70ac45";
-                log.warn("使用默认WBI密钥");
-            }
+        JSONObject wbiImg = navData.getJSONObject("wbi_img");
+        if (wbiImg == null) {
+            return;
         }
+        String imgKey = fileName(wbiImg.getString("img_url"));
+        String subKey = fileName(wbiImg.getString("sub_url"));
+        if (StringUtil.isBlank(imgKey) || StringUtil.isBlank(subKey)) {
+            return;
+        }
+        mixinKey = mixinKey(imgKey + subKey);
+        keyUpdatedAt = System.currentTimeMillis();
+        log.debug("WBI 密钥已更新");
     }
 
     /**
-     * 从URL中提取文件名（不包含扩展名）
+     * 生成可以直接拼到地址后面的、已签名的查询串。
+     * <p>
+     * 返回的是拼好的字符串而不是参数对象：签名是对"编码之后的查询串"求的 MD5，
+     * 如果把参数交给 URIBuilder 再编码一遍，编码规则稍有出入（比如空格是 {@code +} 还是 {@code %20}）
+     * 签名就对不上了。直接把签名时用的那份字符串发出去，两边永远一致。
+     *
+     * @param params 原始请求参数，不会被修改
+     * @return 形如 {@code a=1&wts=...&w_rid=...} 的查询串；密钥不可用时返回空串
      */
-    private static String getFileName(String url) {
-        String fileName = url.substring(url.lastIndexOf('/') + 1);
-        return fileName.substring(0, fileName.lastIndexOf('.'));
+    public static String signedQuery(JSONObject params) {
+        String key = currentMixinKey();
+        if (StringUtil.isBlank(key)) {
+            log.warn("⚠️WBI 密钥不可用，本次请求不带签名发出");
+            return "";
+        }
+        JSONObject signed = new JSONObject();
+        if (params != null) {
+            signed.putAll(params);
+        }
+        signed.put("wts", String.valueOf(System.currentTimeMillis() / 1000));
+
+        String query = buildQuery(signed);
+        return query + "&w_rid=" + md5(query + key);
     }
 
     /**
-     * 生成混合密钥
+     * 计算 w_rid。抽出来是为了能被单元测试直接验证。
+     *
+     * @param params    已经含 wts 的参数
+     * @param mixinKey  32 位 mixin_key
+     * @return 32 位小写 MD5
      */
-    private static String getMixinKey(String orig) {
-        StringBuilder key = new StringBuilder();
-        for (int i = 0; i < 32; i++) {
-            if (MIX_KEY_ENC_TAB[i] < orig.length()) {
-                key.append(orig.charAt(MIX_KEY_ENC_TAB[i]));
+    static String wRid(JSONObject params, String mixinKey) {
+        return md5(buildQuery(params) + mixinKey);
+    }
+
+    /**
+     * 按 key 升序拼出 URL 编码后的查询串。
+     *
+     * @param params 请求参数
+     * @return 形如 {@code bar=514&foo=114} 的查询串
+     */
+    static String buildQuery(JSONObject params) {
+        Map<String, Object> sorted = new TreeMap<>(params);
+        StringBuilder query = new StringBuilder();
+        for (Map.Entry<String, Object> entry : sorted.entrySet()) {
+            if (query.length() > 0) {
+                query.append('&');
+            }
+            query.append(encode(entry.getKey()))
+                 .append('=')
+                 .append(encode(filter(StringUtil.get(entry.getValue()))));
+        }
+        return query.toString();
+    }
+
+    /**
+     * 按乱序表拼出 mixin_key。
+     *
+     * @param orig img_key + sub_key，共 64 位
+     * @return 32 位 mixin_key
+     */
+    static String mixinKey(String orig) {
+        StringBuilder key = new StringBuilder(32);
+        for (int index : MIX_KEY_ENC_TAB) {
+            if (index < orig.length()) {
+                key.append(orig.charAt(index));
+            }
+            if (key.length() == 32) {
+                break;
             }
         }
         return key.toString();
     }
 
     /**
-     * 构建排序后的查询字符串
+     * 与 JS 的 {@code encodeURIComponent} 保持一致。
+     * <p>
+     * {@link URLEncoder} 是 form 编码：空格变 {@code +}、{@code ~} 会被转义，两处都要纠正，
+     * 否则签名和服务端算出来的对不上。
+     *
+     * @param value 待编码的值
+     * @return 编码结果
      */
-    private static String buildSortedQuery(Map<String, Object> params) {
-        return params.entrySet().stream()
-            .sorted(Map.Entry.comparingByKey())
-            .map(entry -> {
-                String value = String.valueOf(entry.getValue());
-                // 过滤特殊字符
-                value = value.replaceAll("[!'()*]", "");
-                return entry.getKey() + "=" + value;
-            })
-            .collect(Collectors.joining("&"));
-    }
-
-    /**
-     * swapString函数 - 2024年新增的WBI算法
-     * @param str 输入字符串
-     * @param depth 递归深度
-     * @return 处理后的字符串
-     */
-    private static String swapString(String str, int depth) {
-        if (str.length() % 2 != 0) return str;
-        if (depth == 0) return str;
-        if (str.length() == Math.pow(2, depth)) {
-            return new StringBuilder(str).reverse().toString();
+    static String encode(String value) {
+        try {
+            return URLEncoder.encode(value, StandardCharsets.UTF_8.name())
+                             .replace("+", "%20")
+                             .replace("%7E", "~");
+        } catch (UnsupportedEncodingException e) {
+            // UTF-8 一定存在，这里不可能发生
+            throw new IllegalStateException(e);
         }
-        
-        String left = str.substring(0, str.length() / 2);
-        String right = str.substring(str.length() / 2);
-        return swapString(right, depth - 1) + swapString(left, depth - 1);
     }
 
     /**
-     * 计算MD5哈希
+     * 剔除官方 JS 会过滤掉的字符。
+     *
+     * @param value 参数值
+     * @return 过滤后的值
      */
-    private static String md5(String input) {
+    private static String filter(String value) {
+        if (value == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(value.length());
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (FILTERED_CHARS.indexOf(c) < 0) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 取当前可用的 mixin_key，必要时补一次 nav 请求。
+     *
+     * @return mixin_key，取不到时为空串
+     */
+    private static synchronized String currentMixinKey() {
+        boolean expired = System.currentTimeMillis() - keyUpdatedAt > KEY_TTL_MS;
+        if (StringUtil.isBlank(mixinKey) || expired) {
+            JSONObject nav = Request.get(BiliApi.NAV);
+            updateFromNav(nav.getJSONObject("data"));
+        }
+        return mixinKey;
+    }
+
+    /**
+     * 从密钥图片地址里取出不带扩展名的文件名。
+     *
+     * @param url 形如 https://i0.hdslb.com/bfs/wbi/xxx.png
+     * @return 文件名，解析不出时为空串
+     */
+    private static String fileName(String url) {
+        if (StringUtil.isBlank(url)) {
+            return "";
+        }
+        int slash = url.lastIndexOf('/');
+        int dot = url.lastIndexOf('.');
+        if (slash < 0 || dot <= slash) {
+            return "";
+        }
+        return url.substring(slash + 1, dot);
+    }
+
+    /**
+     * 32 位小写 MD5。
+     *
+     * @param input 输入
+     * @return 摘要
+     */
+    static String md5(String input) {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] hashBytes = md.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder();
-            for (byte b : hashBytes) {
-                sb.append(String.format("%02x", b));
+            byte[] digest = md.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(32);
+            for (byte b : digest) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
             }
             return sb.toString();
-        } catch (Exception e) {
-            log.error("💔MD5计算失败: ", e);
-            return "";
+        } catch (NoSuchAlgorithmException e) {
+            // MD5 是 JDK 必备算法
+            throw new IllegalStateException(e);
         }
     }
 }

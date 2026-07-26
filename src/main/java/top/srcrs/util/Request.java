@@ -1,453 +1,525 @@
 package top.srcrs.util;
 
 import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONException;
 import com.alibaba.fastjson2.JSONObject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
 import org.apache.http.NameValuePair;
+import org.apache.http.client.config.CookieSpecs;
 import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.methods.RequestBuilder;
+import org.apache.http.client.utils.URIBuilder;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.message.BasicNameValuePair;
 import org.apache.http.util.EntityUtils;
 import top.srcrs.domain.UserData;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
 import java.util.Map;
-import java.util.Random;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 封装的网络请求请求工具类
+ * 网络请求工具类。
+ * <p>
+ * 相比早期版本主要有三点变化：
+ * <ol>
+ *   <li>Cookie 里补上了 buvid3 / buvid4 / bili_ticket，缺了这些现在很容易被判成机器人；</li>
+ *   <li>限速改成真正的滑动窗口，老实现的计数器不会归零，跑到后面每个请求都要干等一分钟；</li>
+ *   <li>请求失败不再抛异常，而是返回 {@code code = -1} 的结果，任务侧统一按"这项没做成"处理。</li>
+ * </ol>
  *
  * @author srcrs
  * @Time 2020-10-13
  */
 @Slf4j
-public class Request {
-    /**
-     * 获取data对象
-     */
+public final class Request {
+
+    private Request() {
+    }
+
+    /** 网络层自身的失败码，与 B 站返回的业务码区分开 */
+    public static final int TRANSPORT_ERROR = -1;
+
     private static final UserData USER_DATA = UserData.getInstance();
 
-    public static String UserAgent = "";
-    
-    // 请求频率控制相关变量
-    private static final AtomicLong lastRequestTime = new AtomicLong(0);
-    private static final AtomicInteger consecutiveErrors = new AtomicInteger(0);
-    private static final AtomicInteger requestCount = new AtomicInteger(0);
-    private static final Map<String, AtomicLong> domainLastRequest = new ConcurrentHashMap<>();
-    private static final Map<String, AtomicInteger> domainErrorCount = new ConcurrentHashMap<>();
-    
-    // 配置参数
-    private static final int BASE_INTERVAL = 800;        // 基础间隔800ms
-    private static final int MAX_INTERVAL = 5000;        // 最大间隔5秒
-    private static final int ERROR_PENALTY = 2000;       // 错误惩罚2秒
-    private static final int MAX_REQUESTS_PER_MINUTE = 30; // 每分钟最大请求数
-    private static final long MINUTE_IN_MS = 60000;      // 一分钟的毫秒数
-    
-    private Request() {}
+    /** 两次请求之间的最小间隔 */
+    private static final long MIN_INTERVAL_MS = 600L;
+    /** 在最小间隔基础上叠加的随机抖动上限 */
+    private static final long JITTER_MS = 500L;
+    /** 每分钟最多发出的请求数 */
+    private static final int MAX_PER_MINUTE = 40;
+    private static final long ONE_MINUTE_MS = 60_000L;
 
-    /**
-     * 发送get请求
-     *
-     * @param url 请求的地址，包括参数
-     * @param pJson 携带的参数
-     * @return JSONObject
-     * @author srcrs
-     * @Time 2020-10-13
-     */
-    public static JSONObject get(String url, JSONObject pJson) {
-        waitFor(url);
-        HttpUriRequest httpGet = getBaseBuilder(HttpGet.METHOD_NAME)
-                .setUri(url)
-                .addParameters(getPairList(pJson))
-                .build();
-        return clientExe(httpGet, url);
+    /** 单次请求的重试次数（含首次） */
+    private static final int MAX_ATTEMPTS = 2;
+
+    private static final Deque<Long> RECENT_REQUESTS = new ArrayDeque<>();
+    private static long lastRequestAt = 0L;
+
+    /** 网络层失败次数，运行结束时汇总用 */
+    private static final AtomicInteger TRANSPORT_ERRORS = new AtomicInteger();
+
+    private static volatile String userAgent = InitUserAgent.getOne();
+    private static volatile boolean bootstrapped = false;
+    private static volatile String buvid3 = "";
+    private static volatile String buvid4 = "";
+    private static volatile String biliTicket = "";
+
+    private static final CloseableHttpClient CLIENT = buildClient();
+
+    private static CloseableHttpClient buildClient() {
+        PoolingHttpClientConnectionManager manager = new PoolingHttpClientConnectionManager();
+        manager.setMaxTotal(16);
+        manager.setDefaultMaxPerRoute(8);
+        RequestConfig config = RequestConfig.custom()
+                                            .setConnectTimeout(10_000)
+                                            .setSocketTimeout(20_000)
+                                            .setConnectionRequestTimeout(5_000)
+                                            // 自己拼 Cookie 头，关掉 httpclient 的 Cookie 管理避免它把请求头改写掉
+                                            .setCookieSpec(CookieSpecs.IGNORE_COOKIES)
+                                            .build();
+        return HttpClients.custom()
+                          .setConnectionManager(manager)
+                          .setDefaultRequestConfig(config)
+                          .disableAutomaticRetries()
+                          .build();
     }
 
     /**
-     * 发送get请求
+     * 设置本次运行使用的 UserAgent。
      *
-     * @param url 请求的地址，包括参数
-     * @return JSONObject
-     * @author srcrs
-     * @Time 2020-10-13
+     * @param ua UserAgent
+     */
+    public static void setUserAgent(String ua) {
+        if (StringUtil.isNotBlank(ua)) {
+            userAgent = ua;
+        }
+    }
+
+    /**
+     * 网络层失败的累计次数。
+     *
+     * @return 失败次数
+     */
+    public static int transportErrors() {
+        return TRANSPORT_ERRORS.get();
+    }
+
+    /* ------------------------------ 对外的请求方法 ------------------------------ */
+
+    /**
+     * 发送 GET 请求。
+     *
+     * @param url 请求地址
+     * @return 响应内容
      */
     public static JSONObject get(String url) {
-        log.info("🔄开始GET请求: {}", url);
         return get(url, new JSONObject());
     }
 
     /**
-     * 发送带WBI签名的GET请求
+     * 发送 GET 请求。
      *
-     * @param url 请求的地址
-     * @param params 请求参数
-     * @return JSONObject
-     * @author chuiba
-     * @Time 2025-01-21
+     * @param url    请求地址
+     * @param params 查询参数
+     * @return 响应内容
      */
-    public static JSONObject getWithWbi(String url, JSONObject params) {
-        try {
-            // 转换参数格式
-            Map<String, Object> paramMap = new HashMap<>();
-            for (String key : params.keySet()) {
-                paramMap.put(key, params.get(key));
-            }
-
-            // 获取WBI签名
-            Map<String, String> wbiParams = WbiSignature.getWbiSign(paramMap);
-
-            // 添加WBI参数
-            JSONObject finalParams = new JSONObject(params);
-            finalParams.put("w_rid", wbiParams.get("w_rid"));
-            finalParams.put("wts", wbiParams.get("wts"));
-
-            return get(url, finalParams);
-        } catch (Exception e) {
-            log.error("💔WBI请求失败: ", e);
-            recordError(url);
-            throw new RuntimeException("WBI请求失败: " + e.getMessage(), e);
-        }
+    public static JSONObject get(String url, JSONObject params) {
+        return get(url, params, BiliApi.REFERER_MAIN);
     }
 
     /**
-     * 发送post请求
+     * 发送 GET 请求。
      *
-     * @param url  请求的地址
-     * @param pJson 携带的参数
-     * @return JSONObject
-     * @author srcrs
-     * @Time 2020-10-13
+     * @param url     请求地址
+     * @param params  查询参数
+     * @param referer Referer 头，B 站部分接口会校验
+     * @return 响应内容
      */
-    public static JSONObject post(String url, JSONObject pJson) {
-        waitFor(url);
-        HttpUriRequest httpPost = getBaseBuilder(HttpPost.METHOD_NAME)
-                .addHeader("accept", "application/json, text/plain, */*")
-                .addHeader("Content-Type", "application/x-www-form-urlencoded")
-                .addHeader("charset", "UTF-8")
-                .setUri(url)
-                .addParameters(getPairList(pJson))
-                .build();
-        return clientExe(httpPost, url);
+    public static JSONObject get(String url, JSONObject params, String referer) {
+        URI uri = withQuery(url, params);
+        if (uri == null) {
+            return error("请求地址不合法: " + url);
+        }
+        return execute(builder(HttpGet.METHOD_NAME, referer).setUri(uri).build());
     }
 
     /**
-     * 发送POST请求，不包含bili_ticket（用于获取bili_ticket本身，避免循环调用）
+     * 发送带 WBI 签名的 GET 请求。
+     *
+     * @param url    请求地址
+     * @param params 查询参数，签名会在内部补齐
+     * @return 响应内容
      */
-    public static JSONObject postWithoutBiliTicket(String url, JSONObject pJson) {
-        waitFor(url);
-        HttpUriRequest httpPost = getBaseBuilder(HttpPost.METHOD_NAME, false)
-                .addHeader("accept", "application/json, text/plain, */*")
-                .addHeader("Content-Type", "application/x-www-form-urlencoded")
-                .addHeader("charset", "UTF-8")
-                .setUri(url)
-                .addParameters(getPairList(pJson))
-                .build();
-        return clientExe(httpPost, url);
+    public static JSONObject getWbi(String url, JSONObject params) {
+        return getWbi(url, params, BiliApi.REFERER_MAIN);
     }
 
     /**
-     * 发送带WBI签名的POST请求
+     * 发送带 WBI 签名的 GET 请求。
+     *
+     * @param url     请求地址
+     * @param params  查询参数，签名会在内部补齐
+     * @param referer Referer 头
+     * @return 响应内容
      */
-    public static JSONObject postWithWbi(String url, JSONObject pJson) {
+    public static JSONObject getWbi(String url, JSONObject params, String referer) {
+        String query = WbiSignature.signedQuery(params);
+        if (query.isEmpty()) {
+            // 签名拿不到时退回普通请求，让接口自己决定要不要放行
+            return get(url, params, referer);
+        }
+        return getRaw(url, query, referer);
+    }
+
+    /**
+     * 用已经编码好的查询串发送 GET 请求，不做二次编码。
+     *
+     * @param url      请求地址
+     * @param rawQuery 已编码的查询串
+     * @param referer  Referer 头
+     * @return 响应内容
+     */
+    private static JSONObject getRaw(String url, String rawQuery, String referer) {
+        String full = url + (url.indexOf('?') >= 0 ? "&" : "?") + rawQuery;
         try {
-            // 转换参数格式
-            Map<String, Object> paramMap = new HashMap<>();
-            for (String key : pJson.keySet()) {
-                paramMap.put(key, pJson.get(key));
-            }
-
-            // 获取WBI签名
-            Map<String, String> wbiParams = WbiSignature.getWbiSign(paramMap);
-
-            // 添加WBI参数
-            JSONObject finalParams = new JSONObject(pJson);
-            finalParams.put("w_rid", wbiParams.get("w_rid"));
-            finalParams.put("wts", wbiParams.get("wts"));
-
-            return post(url, finalParams);
-        } catch (Exception e) {
-            log.error("💔WBI POST请求失败: ", e);
-            recordError(url);
-            throw new RuntimeException("WBI POST请求失败: " + e.getMessage(), e);
+            return execute(builder(HttpGet.METHOD_NAME, referer).setUri(URI.create(full)).build());
+        } catch (IllegalArgumentException e) {
+            log.error("💔地址解析失败: {}", url, e);
+            return error("请求地址不合法: " + url);
         }
     }
 
-    private static RequestBuilder getBaseBuilder(final String method) {
-        return getBaseBuilder(method, true);
+    /**
+     * 发送 POST 请求，参数放在表单体里。
+     *
+     * @param url  请求地址
+     * @param form 表单参数
+     * @return 响应内容
+     */
+    public static JSONObject post(String url, JSONObject form) {
+        return post(url, form, BiliApi.REFERER_MAIN);
     }
 
-    private static RequestBuilder getBaseBuilder(final String method, boolean includeBiliTicket) {
-        String cookie = USER_DATA.getCookie();
+    /**
+     * 发送 POST 请求，参数放在表单体里。
+     *
+     * @param url     请求地址
+     * @param form    表单参数
+     * @param referer Referer 头
+     * @return 响应内容
+     */
+    public static JSONObject post(String url, JSONObject form, String referer) {
+        HttpUriRequest request = builder(HttpPost.METHOD_NAME, referer)
+                .addHeader("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                .setUri(url)
+                .addParameters(pairs(form))
+                .build();
+        return execute(request);
+    }
 
-        // 只有在需要时才获取bili_ticket，避免循环调用
-        if (includeBiliTicket) {
-            try {
-                String biliTicket = BiliTicket.getBiliTicket();
-                if (!biliTicket.isEmpty()) {
-                    cookie += "bili_ticket=" + biliTicket + ";";
-                }
-            } catch (Exception e) {
-                log.warn("获取bili_ticket失败，跳过: {}", e.getMessage());
+    /**
+     * 发送 POST 请求，但参数放在查询串里。
+     * <p>
+     * bili_ticket 接口就只认查询串，之前把参数塞进表单体，服务端一直回 {@code empty ts field}。
+     *
+     * @param url    请求地址
+     * @param params 查询参数
+     * @return 响应内容
+     */
+    public static JSONObject postQuery(String url, JSONObject params) {
+        return postQuery(url, params, BiliApi.REFERER_MAIN);
+    }
+
+    /**
+     * 发送 POST 请求，但参数放在查询串里。
+     *
+     * @param url     请求地址
+     * @param params  查询参数
+     * @param referer Referer 头
+     * @return 响应内容
+     */
+    public static JSONObject postQuery(String url, JSONObject params, String referer) {
+        URI uri = withQuery(url, params);
+        if (uri == null) {
+            return error("请求地址不合法: " + url);
+        }
+        return execute(builder(HttpPost.METHOD_NAME, referer).setUri(uri).build());
+    }
+
+    /**
+     * 把 JSON 参数转成 httpclient 的键值对数组。
+     * <p>
+     * 推送相关的工具类还在用，保留为公开方法。
+     *
+     * @param params 参数
+     * @return 键值对数组
+     */
+    public static NameValuePair[] pairs(JSONObject params) {
+        List<NameValuePair> list = new ArrayList<>();
+        if (params != null) {
+            for (Map.Entry<String, Object> entry : params.entrySet()) {
+                list.add(new BasicNameValuePair(entry.getKey(), StringUtil.get(entry.getValue())));
             }
         }
+        return list.toArray(new NameValuePair[0]);
+    }
 
+    /**
+     * 构造一个失败结果，字段与 B 站返回保持一致，任务侧不用区分来源。
+     *
+     * @param message 失败原因
+     * @return 失败结果
+     */
+    public static JSONObject error(String message) {
+        JSONObject json = new JSONObject();
+        json.put("code", TRANSPORT_ERROR);
+        json.put("message", message);
+        return json;
+    }
+
+    /**
+     * 安全地取出业务返回码。
+     * <p>
+     * 漫画那套 twirp 接口出错时会把 code 写成 {@code "invalid_argument"} 这类字符串，
+     * 直接按 int 读会抛 {@link NumberFormatException}。
+     *
+     * @param json 响应内容
+     * @return 返回码；缺失或者不是数字时返回 {@link #TRANSPORT_ERROR}
+     */
+    public static int code(JSONObject json) {
+        if (json == null) {
+            return TRANSPORT_ERROR;
+        }
+        Object raw = json.get("code");
+        if (raw instanceof Number) {
+            return ((Number) raw).intValue();
+        }
+        if (raw == null) {
+            return TRANSPORT_ERROR;
+        }
+        try {
+            return Integer.parseInt(raw.toString().trim());
+        } catch (NumberFormatException e) {
+            return TRANSPORT_ERROR;
+        }
+    }
+
+    /**
+     * 取出响应里的提示文案，兼容 {@code message} 与 {@code msg} 两种字段名。
+     *
+     * @param json 响应内容
+     * @return 提示文案，没有时返回空串
+     */
+    public static String message(JSONObject json) {
+        if (json == null) {
+            return "";
+        }
+        String message = json.getString("message");
+        if (StringUtil.isBlank(message)) {
+            message = json.getString("msg");
+        }
+        return StringUtil.trimToEmpty(message);
+    }
+
+    /* ------------------------------ 内部实现 ------------------------------ */
+
+    private static RequestBuilder builder(String method, String referer) {
+        bootstrap();
         return RequestBuilder.create(method)
-                             .addHeader("connection", "keep-alive")
-                             .addHeader("referer", "https://www.bilibili.com/")
-                             .addHeader("User-Agent", UserAgent)
-                             .addHeader("Cookie", cookie);
+                             .addHeader("Accept", "application/json, text/plain, */*")
+                             .addHeader("Accept-Language", "zh-CN,zh;q=0.9")
+                             .addHeader("Connection", "keep-alive")
+                             .addHeader("Origin", "https://www.bilibili.com")
+                             .addHeader("Referer", referer == null ? BiliApi.REFERER_MAIN : referer)
+                             .addHeader("User-Agent", userAgent)
+                             .addHeader("Cookie", cookie());
     }
 
-    public static NameValuePair[] getPairList(JSONObject pJson) {
-        return pJson.entrySet().parallelStream().map(Request::getNameValuePair).toArray(NameValuePair[]::new);
+    /**
+     * 拼出请求使用的 Cookie。
+     *
+     * @return Cookie 头的值
+     */
+    private static String cookie() {
+        StringBuilder sb = new StringBuilder(USER_DATA.getCookie());
+        appendCookie(sb, "buvid3", buvid3);
+        appendCookie(sb, "buvid4", buvid4);
+        appendCookie(sb, "bili_ticket", biliTicket);
+        return sb.toString();
     }
 
-    private static NameValuePair getNameValuePair(Map.Entry<String, Object> entry) {
-        return new BasicNameValuePair(entry.getKey(), StringUtil.get(entry.getValue()));
-    }
-
-    public static JSONObject clientExe(HttpUriRequest request) {
-        return clientExe(request, request.getURI().toString());
-    }
-    
-    public static JSONObject clientExe(HttpUriRequest request, String url) {
-        log.info("🌐开始执行HTTP请求: {} {}", request.getMethod(), request.getURI());
-        // 配置超时时间
-        RequestConfig config = RequestConfig.custom()
-                .setConnectTimeout(10000) // 连接超时10秒
-                .setSocketTimeout(30000)   // 读取超时30秒
-                .setConnectionRequestTimeout(5000) // 请求超时5秒
-                .build();
-
-        try (CloseableHttpClient client = HttpClients.custom()
-                .setDefaultRequestConfig(config)
-                .build()) {
-            HttpResponse resp = client.execute(request);
-            HttpEntity entity = resp.getEntity();
-            String respContent = EntityUtils.toString(entity, StandardCharsets.UTF_8);
-
-            // 检查响应是否为有效JSON
-            if(respContent == null || respContent.trim().isEmpty()) {
-                log.error("💔{}请求返回空响应", request.getMethod());
-                recordError(url);
-                throw new RuntimeException("API响应为空");
-            }
-
-            // 检查是否是HTML错误页面（通常以 < 开头）
-            if(respContent.trim().startsWith("<")) {
-                log.error("💔{}请求返回HTML错误页面: {}", request.getMethod(), respContent.substring(0, Math.min(100, respContent.length())));
-                recordError(url);
-                throw new RuntimeException("API返回HTML错误页面，可能是认证失败或API不可用");
-            }
-
-            try {
-                JSONObject result = JSON.parseObject(respContent);
-                // 检查API响应状态码
-                if (result != null && result.containsKey("code")) {
-                    String code = result.getString("code");
-                    if ("0".equals(code)) {
-                        recordSuccess(url);
-                        log.debug("✅{}请求成功: {}", request.getMethod(), url);
-                    } else {
-                        // API返回错误码，但不一定是网络错误，根据具体错误码决定是否记录错误
-                        if ("-352".equals(code) || "-403".equals(code) || "-412".equals(code)) {
-                            recordError(url);
-                            log.warn("⚠️{}请求API错误: {} - {}", request.getMethod(), code, result.getString("message"));
-                        } else {
-                            log.info("ℹ️{}请求API返回: {} - {}", request.getMethod(), code, result.getString("message"));
-                        }
-                    }
-                } else {
-                    recordSuccess(url);
-                }
-                return result;
-            } catch (Exception parseException) {
-                log.error("💔{}请求JSON解析失败，响应长度: {} 字符", request.getMethod(), respContent.length());
-                recordError(url);
-                throw new RuntimeException("JSON解析失败: " + parseException.getMessage(), parseException);
-            }
-        } catch (Exception e) {
-            log.error("💔{}请求错误 : ", request.getMethod(), e);
-            recordError(url);
-            throw new RuntimeException("API请求失败: " + e.getMessage(), e);
+    private static void appendCookie(StringBuilder sb, String name, String value) {
+        if (StringUtil.isNotBlank(value)) {
+            sb.append(name).append('=').append(value).append(';');
         }
     }
 
     /**
-     * 智能请求间隔控制
-     * 根据请求频率、错误次数和域名进行动态调整
-     * @author chuiba (updated from srcrs)
-     * @Time 2025-01-21
+     * 首次请求前补齐风控相关的 Cookie。
+     * <p>
+     * 先把标记置位再去请求，避免这两个请求自己又触发一次初始化。
      */
-    public static void waitFor() {
-        waitFor(null);
-    }
-    
-    /**
-     * 智能请求间隔控制（带域名参数）
-     * @param url 请求URL，用于域名级别的频率控制
-     */
-    public static void waitFor(String url) {
+    private static synchronized void bootstrap() {
+        if (bootstrapped) {
+            return;
+        }
+        bootstrapped = true;
         try {
-            long currentTime = System.currentTimeMillis();
-            String domain = extractDomain(url);
-            
-            // 检查全局请求频率限制
-            checkGlobalRateLimit(currentTime);
-            
-            // 计算智能间隔
-            long interval = calculateSmartInterval(domain, currentTime);
-            
-            // 执行等待
-            if (interval > 0) {
-                log.debug("⏰智能等待 {}ms (域名: {})", interval, domain != null ? domain : "全局");
-                Thread.sleep(interval);
+            JSONObject spi = get(BiliApi.FINGER_SPI);
+            JSONObject data = spi.getJSONObject("data");
+            if (data != null) {
+                buvid3 = StringUtil.trimToEmpty(data.getString("b_3"));
+                buvid4 = StringUtil.trimToEmpty(data.getString("b_4"));
             }
-            
-            // 更新请求时间记录
-            updateRequestTime(domain, currentTime);
-            
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            log.warn("等待过程被中断", e);
+            if (StringUtil.isBlank(buvid3)) {
+                buvid3 = InitUserAgent.randomBuvid();
+                log.debug("buvid 接口不可用，改用本地生成的 buvid3");
+            }
+            biliTicket = BiliTicket.fetch();
         } catch (Exception e) {
-            log.warn("等待过程中出错", e);
+            log.warn("⚠️初始化风控 Cookie 失败，继续以基础 Cookie 运行: {}", e.getMessage());
         }
     }
-    
+
     /**
-     * 提取URL中的域名
+     * 把参数拼到地址的查询串上。
+     *
+     * @param url    原始地址，允许自带查询串
+     * @param params 追加的参数
+     * @return 拼好的地址，地址非法时返回 null
      */
-    private static String extractDomain(String url) {
-        if (url == null || url.isEmpty()) {
+    private static URI withQuery(String url, JSONObject params) {
+        try {
+            URIBuilder uriBuilder = new URIBuilder(url);
+            if (params != null) {
+                for (Map.Entry<String, Object> entry : params.entrySet()) {
+                    uriBuilder.addParameter(entry.getKey(), StringUtil.get(entry.getValue()));
+                }
+            }
+            return uriBuilder.build();
+        } catch (URISyntaxException e) {
+            log.error("💔地址解析失败: {}", url, e);
+            return null;
+        }
+    }
+
+    private static JSONObject execute(HttpUriRequest request) {
+        String url = request.getURI().getPath();
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            throttle();
+            try (CloseableHttpResponse response = CLIENT.execute(request)) {
+                int status = response.getStatusLine().getStatusCode();
+                String body = response.getEntity() == null
+                        ? ""
+                        : EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                JSONObject result = parse(status, body, url);
+                if (result != null) {
+                    logResult(request.getMethod(), url, result);
+                    return result;
+                }
+            } catch (IOException e) {
+                log.warn("⚠️{} {} 网络异常 (第 {}/{} 次): {}",
+                        request.getMethod(), url, attempt, MAX_ATTEMPTS, e.getMessage());
+            }
+            if (attempt < MAX_ATTEMPTS) {
+                sleep(1000L * attempt);
+            }
+        }
+        TRANSPORT_ERRORS.incrementAndGet();
+        log.error("💔{} {} 请求失败，已重试 {} 次", request.getMethod(), url, MAX_ATTEMPTS);
+        return error("请求失败: " + url);
+    }
+
+    /**
+     * 解析响应体。
+     *
+     * @param status HTTP 状态码
+     * @param body   响应体
+     * @param url    请求路径，仅用于日志
+     * @return 解析结果；返回 null 表示这次响应不可用，可以重试
+     */
+    private static JSONObject parse(int status, String body, String url) {
+        String trimmed = body == null ? "" : body.trim();
+        if (trimmed.isEmpty()) {
+            log.warn("⚠️{} 返回空响应 (HTTP {})", url, status);
+            return null;
+        }
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+            // 触发风控或者被跳到登录页时会返回 HTML
+            log.warn("⚠️{} 返回了非 JSON 内容 (HTTP {})，可能已触发风控", url, status);
             return null;
         }
         try {
-            if (url.startsWith("http")) {
-                return url.split("/")[2];
-            }
-        } catch (Exception e) {
-            log.debug("提取域名失败: {}", url);
+            JSONObject json = JSON.parseObject(trimmed);
+            return json == null ? null : json;
+        } catch (JSONException e) {
+            log.warn("⚠️{} 响应解析失败 (HTTP {}): {}", url, status, e.getMessage());
+            return null;
         }
-        return null;
     }
-    
-    /**
-     * 检查全局请求频率限制
-     */
-    private static void checkGlobalRateLimit(long currentTime) throws InterruptedException {
-        // 清理过期的请求计数
-        if (currentTime - lastRequestTime.get() > MINUTE_IN_MS) {
-            requestCount.set(0);
+
+    private static void logResult(String method, String url, JSONObject result) {
+        int code = code(result);
+        if (code == 0) {
+            log.debug("✅{} {}", method, url);
+            return;
         }
-        
-        // 检查是否超过每分钟请求限制
-        if (requestCount.get() >= MAX_REQUESTS_PER_MINUTE) {
-            long waitTime = MINUTE_IN_MS - (currentTime - lastRequestTime.get());
-            if (waitTime > 0) {
-                log.warn("⚠️达到请求频率限制，等待 {}ms", waitTime);
-                Thread.sleep(waitTime);
-            }
-            requestCount.set(0);
-        }
-        
-        requestCount.incrementAndGet();
-    }
-    
-    /**
-     * 计算智能间隔时间
-     */
-    private static long calculateSmartInterval(String domain, long currentTime) {
-        long baseInterval = BASE_INTERVAL;
-        
-        // 全局错误惩罚
-        int globalErrors = consecutiveErrors.get();
-        if (globalErrors > 0) {
-            baseInterval += Math.min(globalErrors * ERROR_PENALTY, MAX_INTERVAL);
-            log.debug("🚨全局错误惩罚: {}次错误，增加 {}ms", globalErrors, Math.min(globalErrors * ERROR_PENALTY, MAX_INTERVAL));
-        }
-        
-        // 域名级别的错误惩罚
-        if (domain != null) {
-            AtomicInteger domainErrors = domainErrorCount.get(domain);
-            if (domainErrors != null && domainErrors.get() > 0) {
-                int penalty = Math.min(domainErrors.get() * ERROR_PENALTY / 2, MAX_INTERVAL / 2);
-                baseInterval += penalty;
-                log.debug("🚨域名错误惩罚 {}: {}次错误，增加 {}ms", domain, domainErrors.get(), penalty);
-            }
-            
-            // 检查域名级别的最小间隔
-            AtomicLong domainLastTime = domainLastRequest.get(domain);
-            if (domainLastTime != null) {
-                long timeSinceLastRequest = currentTime - domainLastTime.get();
-                long minDomainInterval = baseInterval / 2; // 域名级别间隔为全局的一半
-                if (timeSinceLastRequest < minDomainInterval) {
-                    baseInterval = Math.max(baseInterval, minDomainInterval - timeSinceLastRequest);
-                }
-            }
-        }
-        
-        // 全局最小间隔检查
-        long timeSinceLastGlobalRequest = currentTime - lastRequestTime.get();
-        if (timeSinceLastGlobalRequest < baseInterval) {
-            baseInterval = baseInterval - timeSinceLastGlobalRequest;
+        String message = message(result);
+        if (code == -412 || code == -352 || code == -509) {
+            log.warn("⚠️{} {} 触发风控: {} - {}", method, url, code, message);
         } else {
-            baseInterval = 0; // 已经等待足够长时间
-        }
-        
-        // 添加随机抖动（±20%）
-        if (baseInterval > 0) {
-            double jitter = 0.8 + (new Random().nextDouble() * 0.4); // 0.8 到 1.2
-            baseInterval = (long) (baseInterval * jitter);
-        }
-        
-        return Math.min(Math.max(baseInterval, 0), MAX_INTERVAL);
-    }
-    
-    /**
-     * 更新请求时间记录
-     */
-    private static void updateRequestTime(String domain, long currentTime) {
-        lastRequestTime.set(currentTime);
-        if (domain != null) {
-            domainLastRequest.computeIfAbsent(domain, k -> new AtomicLong()).set(currentTime);
+            log.debug("ℹ️{} {} 返回: {} - {}", method, url, code, message);
         }
     }
-    
+
     /**
-     * 记录请求成功，重置错误计数
+     * 限速：保证最小间隔，并把每分钟的请求数压在阈值内。
      */
-    public static void recordSuccess(String url) {
-        consecutiveErrors.set(0);
-        String domain = extractDomain(url);
-        if (domain != null) {
-            domainErrorCount.computeIfAbsent(domain, k -> new AtomicInteger()).set(0);
+    private static void throttle() {
+        long waitMs;
+        synchronized (RECENT_REQUESTS) {
+            long now = System.currentTimeMillis();
+            while (!RECENT_REQUESTS.isEmpty() && now - RECENT_REQUESTS.peekFirst() > ONE_MINUTE_MS) {
+                RECENT_REQUESTS.pollFirst();
+            }
+            long readyAt = lastRequestAt + MIN_INTERVAL_MS
+                    + ThreadLocalRandom.current().nextLong(JITTER_MS);
+            if (RECENT_REQUESTS.size() >= MAX_PER_MINUTE) {
+                long windowReadyAt = RECENT_REQUESTS.peekFirst() + ONE_MINUTE_MS;
+                readyAt = Math.max(readyAt, windowReadyAt);
+                log.debug("⏰每分钟请求数已达上限，等待窗口滑动");
+            }
+            waitMs = Math.max(0L, readyAt - now);
+            long scheduledAt = now + waitMs;
+            lastRequestAt = scheduledAt;
+            RECENT_REQUESTS.addLast(scheduledAt);
         }
-        log.debug("✅请求成功，重置错误计数");
+        sleep(waitMs);
     }
-    
-    /**
-     * 记录请求错误，增加错误计数
-     */
-    public static void recordError(String url) {
-        int errors = consecutiveErrors.incrementAndGet();
-        String domain = extractDomain(url);
-        if (domain != null) {
-            int domainErrors = domainErrorCount.computeIfAbsent(domain, k -> new AtomicInteger()).incrementAndGet();
-            log.warn("❌请求错误，全局错误计数: {}，域名 {} 错误计数: {}", errors, domain, domainErrors);
-        } else {
-            log.warn("❌请求错误，全局错误计数: {}", errors);
+
+    private static void sleep(long millis) {
+        if (millis <= 0) {
+            return;
+        }
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 }
