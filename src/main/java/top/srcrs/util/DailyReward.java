@@ -56,8 +56,32 @@ public final class DailyReward {
         return normalize(data);
     }
 
+    /**
+     * 今日投币已获得的经验（0 ~ 50）。
+     * <p>
+     * 优先走专用接口 {@code x/web-interface/coin/today/exp}，它只回一个数字，比从
+     * {@code exp/reward} 里挑字段稳。这个值直接决定今天还要投几个币，读错就会重复花硬币，
+     * 所以多留一条独立的来源。
+     *
+     * @return 今日投币获得的经验；两个来源都拿不到时返回 -1，调用方应当据此跳过投币
+     */
+    public static int coinExp() {
+        JSONObject response = Request.get(BiliApi.COIN_TODAY_EXP);
+        if (Request.code(response) == 0 && response.containsKey("data")) {
+            return response.getIntValue("data", 0);
+        }
+        log.debug("投币经验专用接口不可用，改从每日任务状态里取");
+
+        JSONObject reward = get();
+        if (reward.getBooleanValue("known", false)) {
+            return reward.getIntValue("coins");
+        }
+        log.warn("⚠️无法确认今日已投币数量，本次跳过投币以免重复消耗硬币");
+        return -1;
+    }
+
     private static JSONObject fetch(String url) {
-        JSONObject response = Request.get(url);
+        JSONObject response = Request.get(url, new JSONObject(), BiliApi.REFERER_ACCOUNT_HOME);
         if (Request.code(response) != 0) {
             return null;
         }
@@ -72,6 +96,8 @@ public final class DailyReward {
      */
     static JSONObject normalize(JSONObject data) {
         JSONObject result = new JSONObject();
+        // known 用来区分"确认没做"和"根本没问到"，后者不能当成没做，否则会重复投币
+        result.put("known", data != null && !data.isEmpty());
         result.put("login", bool(data, "login"));
         result.put("watch", bool(data, "watch") || bool(data, "watch_av"));
         result.put("share", bool(data, "share") || bool(data, "share_av"));

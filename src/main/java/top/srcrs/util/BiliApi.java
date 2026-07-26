@@ -30,6 +30,8 @@ public final class BiliApi {
     public static final String EXP_REWARD = "https://api.bilibili.com/x/member/web/exp/reward";
     /** 每日经验任务完成情况（旧接口，作为兜底） */
     public static final String LEGACY_HOME_REWARD = "https://account.bilibili.com/home/reward";
+    /** 今日投币已获得的经验，专用接口，比从 exp/reward 里挑字段可靠 */
+    public static final String COIN_TODAY_EXP = "https://api.bilibili.com/x/web-interface/coin/today/exp";
 
     /* ------------------------------ 视频 ------------------------------ */
 
@@ -37,6 +39,8 @@ public final class BiliApi {
     public static final String POPULAR = "https://api.bilibili.com/x/web-interface/popular";
     /** 首页推荐视频（需要 WBI 签名） */
     public static final String RCMD_WBI = "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd";
+    /** 全站排行榜，不需要登录也不需要签名，是最不容易坏的一路视频来源 */
+    public static final String RANKING_V2 = "https://api.bilibili.com/x/web-interface/ranking/v2";
     /** 视频详细信息 */
     public static final String VIEW = "https://api.bilibili.com/x/web-interface/view";
     /** 视频分 P 列表，用来拿 cid 和时长 */
@@ -106,6 +110,10 @@ public final class BiliApi {
     public static final String REFERER_LIVE = "https://live.bilibili.com/";
     public static final String REFERER_MANGA = "https://manga.bilibili.com/";
     public static final String REFERER_VIP = "https://account.bilibili.com/";
+    /** 经验任务相关接口，web 端是从账号中心页发起的 */
+    public static final String REFERER_ACCOUNT_HOME = "https://account.bilibili.com/account/home";
+    /** 直播签到、银瓜子相关接口，web 端是从直播中心发起的 */
+    public static final String REFERER_LIVE_LINK = "https://link.bilibili.com/";
 
     /**
      * 拼出视频播放页地址，投币/分享时作为 Referer 使用。

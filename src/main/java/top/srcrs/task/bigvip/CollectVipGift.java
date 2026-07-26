@@ -100,7 +100,8 @@ public class CollectVipGift implements Task {
         params.put("type", String.valueOf(type));
         params.put("csrf", userData.getBiliJct());
 
-        JSONObject response = Request.post(BiliApi.VIP_PRIVILEGE_RECEIVE, params, BiliApi.REFERER_VIP);
+        // 这个接口的参数要放在查询串里，塞进表单体是收不到的
+        JSONObject response = Request.postQuery(BiliApi.VIP_PRIVILEGE_RECEIVE, params, BiliApi.REFERER_VIP);
         if (Request.code(response) == 0) {
             log.info("【领取{}】: 成功✔", name);
             return true;

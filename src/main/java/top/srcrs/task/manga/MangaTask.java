@@ -33,7 +33,8 @@ public class MangaTask implements Task {
 
         JSONObject params = new JSONObject();
         params.put("platform", platform);
-        JSONObject response = Request.post(BiliApi.MANGA_CLOCK_IN, params, BiliApi.REFERER_MANGA);
+        // platform 要跟在地址后面，放进表单体这个接口读不到
+        JSONObject response = Request.postQuery(BiliApi.MANGA_CLOCK_IN, params, BiliApi.REFERER_MANGA);
 
         if (Request.code(response) == 0) {
             log.info("【漫画签到】: 成功✔");

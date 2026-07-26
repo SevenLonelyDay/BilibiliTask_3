@@ -53,10 +53,10 @@ public class Silver2CoinTask implements Task {
         params.put("csrf", userData.getBiliJct());
         params.put("csrf_token", userData.getBiliJct());
 
-        JSONObject response = Request.post(BiliApi.LIVE_SILVER2COIN, params, BiliApi.REFERER_LIVE);
+        JSONObject response = Request.post(BiliApi.LIVE_SILVER2COIN, params, BiliApi.REFERER_LIVE_LINK);
         if (Request.code(response) != 0) {
             log.debug("新版兑换接口返回 {}，尝试旧接口", response.getString("code"));
-            response = Request.post(BiliApi.LIVE_SILVER2COIN_LEGACY, params, BiliApi.REFERER_LIVE);
+            response = Request.post(BiliApi.LIVE_SILVER2COIN_LEGACY, params, BiliApi.REFERER_LIVE_LINK);
         }
         if (Request.code(response) == 0) {
             String message = response.getString("msg");
@@ -74,7 +74,7 @@ public class Silver2CoinTask implements Task {
      * @return 银瓜子数量，查不到时为 0
      */
     private int getSilver() {
-        JSONObject response = Request.get(BiliApi.LIVE_USER_INFO, new JSONObject(), BiliApi.REFERER_LIVE);
+        JSONObject response = Request.get(BiliApi.LIVE_USER_INFO, new JSONObject(), BiliApi.REFERER_LIVE_LINK);
         if (Request.code(response) != 0) {
             log.warn("⚠️获取银瓜子余额失败: {}", response.getString("message"));
             return 0;

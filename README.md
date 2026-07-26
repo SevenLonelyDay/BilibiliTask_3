@@ -76,8 +76,9 @@
 + Dockerfile 从已停止维护的 JDK 8 镜像改为多阶段构建 + `eclipse-temurin:17`
 + 清掉了误提交进仓库的 1500 行 CI 日志和 `.idea/` 目录
 
-> 说明：接口相关的改动依据的是 B 站 web 端的公开行为和社区维护的
-> [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect) 文档。
+> 说明：接口相关的改动依据的是 B 站 web 端的公开行为，并对照仍在维护的同类项目
+> [BiliBiliToolPro](https://github.com/RayWangQvQ/BiliBiliToolPro) 逐个核对过
+> （原先常用的 bilibili-API-collect 已于 2026 年 1 月停止维护并删除全部文档）。
 > 编译和单元测试是绿的，但**能否真正跑通取决于你自己账号的实际情况**，
 > 建议首次部署后先手动触发一次，看一遍日志再交给定时任务。
 
@@ -337,6 +338,22 @@ git push origin main
 ```
 
 # 更新日志
+
+## 2026-07-26 二次核对 (v2.0.1)
+
+对照仍在维护的同类项目 [BiliBiliToolPro](https://github.com/RayWangQvQ/BiliBiliToolPro) 交叉验证了一遍接口，
+确认无误的部分不动，另外改掉 5 处：
+
++ 投币经验改用专用接口 `x/web-interface/coin/today/exp`，并新增"问不到就不投"的保护，
+  避免接口异常时重复消耗硬币
++ 大会员权益 `x/vip/privilege/receive` 的参数改放查询串（放表单体接口收不到）
++ 漫画签到 `ClockIn` 的 `platform` 同样改放查询串
++ 视频心跳补上 `?aid=&played_time=` 查询参数
++ 新增排行榜 `x/web-interface/ranking/v2` 作为第三路视频来源，它既不要登录也不要签名
++ 修正 Referer：经验任务用账号中心页，直播签到与银瓜子用 `link.bilibili.com`
+
+> 注意：本项目原先参考的 [bilibili-API-collect](https://github.com/SocialSisterYi/bilibili-API-collect)
+> 已于 2026 年 1 月 28 日因收到 B 站律师函而永久停止维护并删除全部文档。
 
 ## 2026-07-26 复活版 (v2.0.0)
 

@@ -63,4 +63,18 @@ class DailyRewardTest {
         assertFalse(fromNull.getBooleanValue("watch"));
         assertEquals(0, fromNull.getIntValue("coins"));
     }
+
+    @Test
+    @DisplayName("known 能区分「确认没做」和「根本没问到」")
+    void knownFlagSeparatesUnknownFromIncomplete() {
+        // 没问到：coins 同样是 0，但不能据此认为今天一个币都没投
+        assertFalse(DailyReward.normalize(null).getBooleanValue("known"));
+        assertFalse(DailyReward.normalize(new JSONObject()).getBooleanValue("known"));
+
+        JSONObject data = new JSONObject();
+        data.put("login", true);
+        data.put("coins", 0);
+        assertTrue(DailyReward.normalize(data).getBooleanValue("known"));
+        assertEquals(0, DailyReward.normalize(data).getIntValue("coins"));
+    }
 }

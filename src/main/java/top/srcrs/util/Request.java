@@ -242,11 +242,23 @@ public final class Request {
      * @return 响应内容
      */
     public static JSONObject postQuery(String url, JSONObject params) {
+        return postQuery(url, params, BiliApi.REFERER_MAIN);
+    }
+
+    /**
+     * 发送 POST 请求，但参数放在查询串里。
+     *
+     * @param url     请求地址
+     * @param params  查询参数
+     * @param referer Referer 头
+     * @return 响应内容
+     */
+    public static JSONObject postQuery(String url, JSONObject params, String referer) {
         URI uri = withQuery(url, params);
         if (uri == null) {
             return error("请求地址不合法: " + url);
         }
-        return execute(builder(HttpPost.METHOD_NAME, BiliApi.REFERER_MAIN).setUri(uri).build());
+        return execute(builder(HttpPost.METHOD_NAME, referer).setUri(uri).build());
     }
 
     /**

@@ -47,10 +47,36 @@ public final class VideoSource {
                 merged.putIfAbsent(video.getAid(), video);
             }
         }
+        if (merged.size() < limit) {
+            // 排行榜既不要登录也不要签名，前两路都塌了它多半还在
+            for (VideoInfo video : ranking(limit)) {
+                merged.putIfAbsent(video.getAid(), video);
+            }
+        }
         if (merged.isEmpty()) {
-            log.warn("⚠️没有取到任何可用视频，推荐与热门接口可能都不可用");
+            log.warn("⚠️没有取到任何可用视频，推荐、热门、排行榜接口可能都不可用");
         }
         return new ArrayList<>(merged.values());
+    }
+
+    /**
+     * 全站排行榜。
+     *
+     * @param limit 需要的数量
+     * @return 视频列表
+     */
+    public static List<VideoInfo> ranking(int limit) {
+        JSONObject params = new JSONObject();
+        params.put("rid", "0");
+        params.put("type", "all");
+
+        JSONObject response = Request.get(BiliApi.RANKING_V2, params);
+        if (Request.code(response) != 0) {
+            log.debug("排行榜接口不可用: {} - {}", response.getString("code"), Request.message(response));
+            return new ArrayList<>();
+        }
+        JSONObject data = response.getJSONObject("data");
+        return parseArchives(data == null ? null : data.getJSONArray("list"), limit);
     }
 
     /**
@@ -124,7 +150,18 @@ public final class VideoSource {
             return videos;
         }
         JSONObject data = response.getJSONObject("data");
-        JSONArray list = data == null ? null : data.getJSONArray("list");
+        return parseArchives(data == null ? null : data.getJSONArray("list"), limit);
+    }
+
+    /**
+     * 解析常规的稿件列表。热门和排行榜的条目结构是一样的。
+     *
+     * @param list  稿件数组，允许为 null
+     * @param limit 需要的数量
+     * @return 视频列表
+     */
+    private static List<VideoInfo> parseArchives(JSONArray list, int limit) {
+        List<VideoInfo> videos = new ArrayList<>();
         if (list == null) {
             return videos;
         }

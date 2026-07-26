@@ -42,7 +42,11 @@ public class ThrowCoinTask implements Task {
 
     @Override
     public void run() {
-        int gainedExp = DailyReward.get().getIntValue("coins");
+        int gainedExp = DailyReward.coinExp();
+        if (gainedExp < 0) {
+            log.warn("【投币】: 今日已投币数量未知，本次跳过❌");
+            return;
+        }
         int alreadyThrown = gainedExp / EXP_PER_COIN;
 
         updateMoney();

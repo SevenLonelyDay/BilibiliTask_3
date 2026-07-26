@@ -23,7 +23,7 @@ public class BiLiveTask implements Task {
 
     @Override
     public void run() {
-        JSONObject response = Request.get(BiliApi.LIVE_SIGN, new JSONObject(), BiliApi.REFERER_LIVE);
+        JSONObject response = Request.get(BiliApi.LIVE_SIGN, new JSONObject(), BiliApi.REFERER_LIVE_LINK);
         int code = Request.code(response);
 
         if (code == 0) {

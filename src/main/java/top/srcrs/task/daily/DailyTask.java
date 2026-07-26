@@ -146,7 +146,11 @@ public class DailyTask implements Task {
         params.put("session", UUID.randomUUID().toString().replace("-", ""));
         params.put("csrf", userData.getBiliJct());
 
-        JSONObject response = Request.post(BiliApi.CLICK_HEARTBEAT, params,
+        // aid 与 played_time 除了放在表单里，还要跟在地址后面，web 端就是这么发的
+        String url = BiliApi.CLICK_HEARTBEAT
+                + "?aid=" + video.getAid()
+                + "&played_time=" + watchSeconds;
+        JSONObject response = Request.post(url, params,
                 BiliApi.videoPage(video.getBvid(), video.getAid()));
         return Request.code(response) == 0;
     }
